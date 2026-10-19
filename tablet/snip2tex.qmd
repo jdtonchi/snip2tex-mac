@@ -1,0 +1,605 @@
+; snip2tex: adds four buttons to the lasso selection menu.
+;   ∑      inserts the rendered LaTeX (replacing the handwriting, by default)
+;   =      evaluates it and shows the result in a popup (tap to dismiss)
+;   graph  inserts a plot (below the handwriting, by default)
+;   ?      asks Gemma about it: a short answer in the popup, or (Gemma's call)
+;          a diagram inserted below the selection, with a caption in the popup
+;   ✦      swaps the buttons for more actions (in the same menu, so the
+;          selection stays): Solve steps (worked solution inserted below, answer
+;          in the popup), Check work (popup: right, or the first wrong line), ‹ back
+; Icons come from snip2tex.rcc (qrc:/snip2tex/...). Settings come from
+; /home/root/xovi/exthome/snip2tex/config.json, written by the Mac app.
+;
+; grabToImage crashes xochitl's e-ink renderer, so instead the selection
+; overlay is hidden for a moment and snip.sh copies the rows straight out of
+; the framebuffer (framebuffer-spy), uploads them, and saves the reply.
+;
+; Ending a selection destroys this handler, so waiting for the reply and
+; inserting the result happen in small objects created on the window (the job
+; and the popup), not in the handler. The selection itself is ended through
+; DeviceSceneView (snip2texDone below), the same way the menu's Delete does it.
+; Needs: qt-command-executor, framebuffer-spy, xovi-message-broker.
+; Written against firmware 3.27.3.0.
+
+AFFECT /qml/common/SceneSelectionHandler.qml
+    IMPORT net.asivery.CommandExecutor 1.0
+    IMPORT QtQuick.Window 2.15
+    TRAVERSE Item#selectionRoot
+        LOCATE AFTER ALL
+        INSERT {
+            // handled in DeviceSceneView: optionally delete the selected
+            // strokes, then end the selection properly
+            signal snip2texDone(bool replace)
+
+            property bool snip2texBusy: false
+            property bool snip2texMore: false
+            // DeviceSceneView (set there). Objects that outlive this handler must
+            // be created through it: QML objects made with Qt.createQmlObject here
+            // live in this handler's context, and when xochitl destroys the handler
+            // (selection ended) every function in them dies ("attempted to evaluate
+            // a function in an invalid context"), so the popup could never close.
+            property var snip2texFactory: null
+
+            function snip2texCreate(qml, parent, name) {
+                if (snip2texFactory && typeof snip2texFactory.snip2texCreate === "function") {
+                    return snip2texFactory.snip2texCreate(qml, parent, name);
+                }
+                snip2texLog("no factory, popup will die with the selection");
+                return Qt.createQmlObject(qml, parent, name);
+            }
+            property string snip2texMode: "snip"
+            property var snip2texCfg: ({})
+
+            CommandExecutor {
+                id: snip2texCmd
+            }
+
+            function snip2texLog(msg) {
+                console.log("[snip2tex] " + msg);
+            }
+
+            function snip2texConfig() {
+                const cfg = {replace_snip: true, replace_graph: false, selection_padding: 5,
+                             popup_seconds: 30, grab_delay_ms: 700};
+                const xhr = new XMLHttpRequest();
+                xhr.open("GET", "file:///home/root/xovi/exthome/snip2tex/config.json", false);
+                try {
+                    xhr.send();
+                    const saved = JSON.parse(xhr.responseText || "{}");
+                    for (const k in saved) {
+                        cfg[k] = saved[k];
+                    }
+                } catch (e) {
+                    snip2texLog("no config, using defaults");
+                }
+                return cfg;
+            }
+
+            function snip2texHost() {
+                return selectionRoot.Window.window ? selectionRoot.Window.window.contentItem : null;
+            }
+
+            // Popup for the = result and for failures. Polls for its own
+            // result file so it doesn't depend on this handler.
+            // It joins DocumentView's PopupOverlay when it can (attach), as a
+            // duck-typed device.ui.controls Popup: the overlay then closes it
+            // on a tap anywhere outside, like xochitl's own popups. Items placed
+            // straight on the window never got taps over the page.
+            readonly property string snip2texPopupQml: `
+                import QtQuick
+                FocusScope {
+                    id: popupRoot
+                    objectName: "snip2texPopup"
+                    // the Popup contract PopupOverlay relies on
+                    property var overlay: null
+                    // DeviceSceneView: snip2texGhosting() clears the e-ink leftovers
+                    property var factory: null
+                    property bool ghostOpen: false
+                    property int tapOutsideBehavior: 1 // Popup.TapOutside.AcceptAndHide
+                    property bool outsidePenInputBlocked: false
+                    signal shown()
+                    signal hidden()
+                    signal accepted()
+                    signal rejected()
+                    onHidden: dismiss("tap outside")
+
+                    property string resultPath: ""
+                    property int hideAfterMs: 0
+                    property bool closed: false
+                    // for ? answers that come with a diagram (out.png next to out.txt)
+                    property var controller: null
+                    property var handler: null
+                    property point insertAt
+                    property alias text: label.text
+                    // orientation, for the window fallback: rotation and the user's
+                    // "up" and "right" directions in the parent's (physical) coordinates.
+                    // In the overlay the parent is already the user's orientation.
+                    property real angle: 0
+                    property real ux: 0
+                    property real uy: -1
+                    property real rx: 1
+                    property real ry: 0
+                    readonly property real pw: width > 0 ? width : 1620
+                    readonly property real ph: height > 0 ? height : 2160
+                    readonly property real visualWidth: Math.abs(rx) * pw + Math.abs(ry) * ph
+                    readonly property real halfUp: (Math.abs(ux) * pw + Math.abs(uy) * ph) / 2
+                    anchors.fill: parent
+                    z: 10000
+                    visible: !closed && (!overlay || overlay.activePopup === popupRoot)
+
+                    function ghosting(open) {
+                        if (!factory || ghostOpen === open) {
+                            return;
+                        }
+                        ghostOpen = open;
+                        try {
+                            console.log("[snip2tex] popup " + (open ? "shown" : "hidden") + ", refresh via "
+                                        + factory.snip2texGhosting(open));
+                        } catch (e) {
+                            console.log("[snip2tex] ghosting failed: " + e);
+                        }
+                    }
+                    function attach(ov, frame) {
+                        ghosting(true);
+                        if (ov) {
+                            overlay = ov;
+                            parent = ov;
+                            ov.showPopup(popupRoot);
+                        } else {
+                            for (const k in frame) {
+                                popupRoot[k] = frame[k];
+                            }
+                        }
+                    }
+                    function readFile(path) {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open("GET", "file://" + path, false);
+                        try { xhr.send(); } catch (e) { return ""; }
+                        return (xhr.responseText || "").trim();
+                    }
+                    function done(text) {
+                        label.text = text;
+                        resultPath = "";
+                        if (closed) {
+                            destroy();
+                        } else if (hideAfterMs > 0) {
+                            hideTimer.start();
+                        }
+                    }
+                    // closing while ? is still thinking keeps polling, invisibly,
+                    // so a diagram still gets inserted
+                    function dismiss(how) {
+                        if (closed) {
+                            return;
+                        }
+                        closed = true;
+                        console.log("[snip2tex] popup closed by " + how);
+                        if (overlay) {
+                            overlay.hidePopup(popupRoot);
+                        }
+                        ghosting(false);
+                        if (resultPath === "") {
+                            destroy();
+                        }
+                    }
+                    // replaced by a newer popup
+                    function discard() {
+                        closed = true;
+                        if (overlay) {
+                            overlay.hidePopup(popupRoot);
+                        }
+                        ghosting(false);
+                        destroy();
+                    }
+                    Rectangle {
+                        id: card
+                        // distance from the screen centre to the card centre, towards "up"
+                        readonly property real lift: popupRoot.halfUp - 140 - height / 2
+                        color: "white"
+                        border.width: 4
+                        border.color: "black"
+                        radius: 12
+                        rotation: popupRoot.angle
+                        width: Math.min(label.implicitWidth + 100, popupRoot.visualWidth - 80)
+                        height: label.implicitHeight + 60
+                        x: popupRoot.pw / 2 + popupRoot.ux * lift - width / 2
+                        y: popupRoot.ph / 2 + popupRoot.uy * lift - height / 2
+                        Text {
+                            id: label
+                            anchors.centerIn: parent
+                            width: Math.min(implicitWidth, popupRoot.visualWidth - 160)
+                            wrapMode: Text.Wrap
+                            horizontalAlignment: Text.AlignHCenter
+                            font.pointSize: 28
+                            color: "black"
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: popupRoot.dismiss("tap on popup")
+                        }
+                        // a visible way out
+                        Text {
+                            anchors.top: parent.top
+                            anchors.right: parent.right
+                            anchors.margins: 6
+                            text: "✕"
+                            font.pointSize: 18
+                            color: "black"
+                        }
+                    }
+                    // Belt and braces: a passive, touch-only tap anywhere on the screen
+                    // (this popup fills its parent) also closes it, without stealing the
+                    // tap from what's underneath. The pen doesn't count, so the answer
+                    // can be copied down while it's showing.
+                    TapHandler {
+                        acceptedDevices: PointerDevice.TouchScreen
+                        gesturePolicy: TapHandler.DragThreshold
+                        grabPermissions: PointerHandler.ApprovesTakeOverByAnything
+                        onTapped: (point) => popupRoot.dismiss("touch at " + Math.round(point.position.x) + "," + Math.round(point.position.y))
+                    }
+                    Timer {
+                        property int polls: 0
+                        interval: 500
+                        repeat: true
+                        running: popupRoot.resultPath !== ""
+                        onTriggered: {
+                            const p = popupRoot.resultPath;
+                            const err = popupRoot.readFile(p + ".err");
+                            const res = popupRoot.readFile(p);
+                            if (err !== "" || ++polls > 300) {
+                                popupRoot.done("failed: " + (err || "timed out"));
+                            } else if (res !== "") {
+                                const png = p.replace(/\.txt$/, ".png");
+                                if (popupRoot.controller && popupRoot.readFile(png) !== "") {
+                                    // end the selection first, as the job does
+                                    try {
+                                        if (popupRoot.handler && popupRoot.handler.visible) {
+                                            popupRoot.handler.snip2texDone(false);
+                                        }
+                                    } catch (e) {}
+                                    popupRoot.controller.insertImageFileAsSceneItem("file://" + png, popupRoot.insertAt);
+                                }
+                                popupRoot.done(res);
+                            }
+                        }
+                    }
+                    Timer {
+                        id: hideTimer
+                        interval: popupRoot.hideAfterMs
+                        onTriggered: popupRoot.dismiss("timeout")
+                    }
+                }`
+
+            // Waits for an image reply (∑ / graph), then ends the selection and
+            // inserts the image. Lives on the window, so it survives the
+            // handler being destroyed.
+            readonly property string snip2texJobQml: `
+                import QtQuick
+                Item {
+                    property string out: ""
+                    property var controller: null
+                    property var handler: null
+                    property bool replace: false
+                    property point insertAt
+                    property string popupQml: ""
+                    property var popupFrame: ({})
+                    property var popupOverlay: null
+                    property var factory: null
+                    property int polls: 0
+                    function exists(path) {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open("GET", "file://" + path, false);
+                        try { xhr.send(); } catch (e) { return false; }
+                        return xhr.status === 200 || (xhr.responseText || "").length > 0;
+                    }
+                    function handlerAlive() {
+                        try { return handler !== null && handler.visible; } catch (e) { return false; }
+                    }
+                    Timer {
+                        interval: 500
+                        repeat: true
+                        running: true
+                        onTriggered: {
+                            const job = parent;
+                            if (job.exists(job.out + ".err") || ++job.polls > 300) {
+                                stop();
+                                const popup = Qt.createQmlObject(job.popupQml, job.parent, "snip2texPopup");
+                                popup.factory = job.factory;
+                                popup.attach(job.popupOverlay, job.popupFrame);
+                                popup.text = "…";
+                                popup.resultPath = job.out;
+                                job.destroy();
+                            } else if (job.exists(job.out)) {
+                                stop();
+                                // end the selection first: otherwise the strokes stay
+                                // "selected" but hidden until reselected
+                                if (job.handlerAlive()) {
+                                    job.handler.snip2texDone(job.replace);
+                                }
+                                job.controller.insertImageFileAsSceneItem("file://" + job.out, job.insertAt);
+                                console.log("[snip2tex] inserted " + job.out);
+                                job.destroy();
+                            }
+                        }
+                    }
+                }`
+
+            // How the user sees the screen: the selection lives in the rotated UI,
+            // so mapping its axes onto the (physical) window gives "up"/"right"
+            function snip2texFrame(host) {
+                const o = selectionRoot.mapToItem(host, 0, 0);
+                const r = selectionRoot.mapToItem(host, 100, 0);
+                const u = selectionRoot.mapToItem(host, 0, -100);
+                const unit = v => Math.round(v / 100);
+                const rx = unit(r.x - o.x), ry = unit(r.y - o.y);
+                return {angle: Math.round(Math.atan2(ry, rx) * 180 / Math.PI), rx: rx, ry: ry,
+                        ux: unit(u.x - o.x), uy: unit(u.y - o.y)};
+            }
+
+            // DocumentView's PopupOverlay (where xochitl's own popups live): a
+            // sibling of one of the selection's ancestors
+            function snip2texOverlay() {
+                for (let p = selectionRoot.parent; p; p = p.parent) {
+                    for (let i = 0; i < p.children.length; i++) {
+                        const c = p.children[i];
+                        if (c && typeof c.showPopup === "function" && typeof c.hideAllPopups === "function"
+                                && c.penInputManager !== undefined) {
+                            return c;
+                        }
+                    }
+                }
+                snip2texLog("no popup overlay, using the window");
+                return null;
+            }
+
+            function snip2texShow(text, resultPath, withInsert) {
+                const host = snip2texHost();
+                if (!host) {
+                    return;
+                }
+                const overlay = snip2texOverlay();
+                for (const owner of [host, overlay]) {
+                    if (!owner) {
+                        continue;
+                    }
+                    for (let i = owner.children.length - 1; i >= 0; i--) {
+                        const old = owner.children[i];
+                        if (old.objectName === "snip2texPopup") {
+                            try {
+                                old.discard();
+                            } catch (e) {
+                                // made by an older build with a dead context
+                                old.visible = false;
+                                old.objectName = "";
+                            }
+                        }
+                    }
+                }
+                const popup = snip2texCreate(snip2texPopupQml, host, "snip2texPopup");
+                popup.factory = snip2texFactory;
+                popup.attach(overlay, snip2texFrame(host));
+                popup.text = text;
+                popup.hideAfterMs = (snip2texCfg.popup_seconds || 0) * 1000;
+                if (withInsert) {
+                    const r = selectionRoot.sceneSelectionRect;
+                    popup.controller = controller;
+                    popup.handler = selectionRoot;
+                    popup.insertAt = Qt.point(r.x, r.y + r.height + 20);
+                }
+                popup.resultPath = resultPath || "";
+            }
+
+            // mode: "snip" inserts the rendered LaTeX, "graph" inserts a plot,
+            // "eval" and "ask" show text in the popup
+            function snip2texSend(mode) {
+                if (snip2texBusy) {
+                    return;
+                }
+                snip2texBusy = true;
+                snip2texMode = mode;
+                snip2texCfg = snip2texConfig();
+                // hide tint, border and menu so the framebuffer only has ink
+                controlsAreVisible = false;
+                snip2texGrabDelay.interval = snip2texCfg.grab_delay_ms || 700;
+                snip2texGrabDelay.restart();
+            }
+
+            Timer {
+                id: snip2texGrabDelay
+                interval: 700
+                onTriggered: {
+                    const mode = selectionRoot.snip2texMode;
+                    const cfg = selectionRoot.snip2texCfg;
+                    // modes answered in the popup; ask and solve may also insert a PNG
+                    const textMode = ["eval", "ask", "solve", "check"].indexOf(mode) >= 0;
+                    const pad = Math.max(0, Math.round(cfg.selection_padding || 0));
+                    // The framebuffer is always physical portrait, but the UI may be
+                    // rotated: map all four corners and grab their bounding box, and
+                    // tell the Mac how to turn the grab upright
+                    const x0 = Math.min(selection.x, selection.x + selection.width);
+                    const y0 = Math.min(selection.y, selection.y + selection.height);
+                    const x1 = x0 + Math.abs(selection.width), y1 = y0 + Math.abs(selection.height);
+                    const corners = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]].map(c => selectionRoot.mapToItem(null, c[0], c[1]));
+                    const px = Math.round(Math.min(...corners.map(c => c.x))) - pad;
+                    const py = Math.round(Math.min(...corners.map(c => c.y))) - pad;
+                    const w = Math.round(Math.max(...corners.map(c => c.x))) + pad - px;
+                    const h = Math.round(Math.max(...corners.map(c => c.y))) + pad - py;
+                    const rot = snip2texFrame(null).angle;
+                    const out = "/home/root/.snip2tex/out-" + Date.now() + (textMode ? ".txt" : ".png");
+                    const args = [px, py, w, h, out, mode, pad, rot].join(" ");
+                    snip2texLog("grab " + args);
+                    // detach, and keep xovi out of the child process
+                    snip2texCmd.executeCommand("env", ["-u", "LD_PRELOAD", "sh", "-c",
+                        "/home/root/xovi/exthome/snip2tex/snip.sh " + args + " >/dev/null 2>&1 &"]);
+                    controlsAreVisible = true;
+                    selectionRoot.snip2texBusy = false;
+
+                    if (textMode) {
+                        const waiting = {eval: "evaluating…", ask: "thinking…", solve: "solving…", check: "checking…"};
+                        snip2texShow(waiting[mode], out, mode === "ask" || mode === "solve");
+                        return;
+                    }
+                    const host = snip2texHost();
+                    if (!host) {
+                        return;
+                    }
+                    const replace = mode === "snip" ? !!cfg.replace_snip : !!cfg.replace_graph;
+                    // scene coords: in place of the handwriting, or just below it
+                    const r = selectionRoot.sceneSelectionRect;
+                    const job = snip2texCreate(snip2texJobQml, host, "snip2texJob");
+                    job.popupQml = snip2texPopupQml;
+                    job.popupFrame = snip2texFrame(host);
+                    job.popupOverlay = snip2texOverlay();
+                    job.factory = snip2texFactory;
+                    job.controller = controller;
+                    job.handler = selectionRoot;
+                    job.replace = replace;
+                    job.insertAt = replace ? Qt.point(r.x, r.y) : Qt.point(r.x, r.y + r.height + 20);
+                    job.out = out;
+                }
+            }
+        }
+
+        TRAVERSE SelectionContextualMenu#tools
+            LOCATE AFTER ALL
+            INSERT {
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texButton
+                    visible: !selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    iconSource: "qrc:/snip2tex/sigma.svg"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: selectionRoot.snip2texSend("snip")
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texEvalButton
+                    visible: !selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    iconSource: "qrc:/snip2tex/equals.svg"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: selectionRoot.snip2texSend("eval")
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texGraphButton
+                    visible: !selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    iconSource: "qrc:/snip2tex/graph.svg"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: selectionRoot.snip2texSend("graph")
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texAskButton
+                    visible: !selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    iconSource: "qrc:/snip2tex/question.svg"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: selectionRoot.snip2texSend("ask")
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texMoreButton
+                    visible: !selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    iconSource: "qrc:/snip2tex/sparkle.svg"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: selectionRoot.snip2texMore = true
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texSolveButton
+                    visible: selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    text: "Solve steps"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: {
+                        selectionRoot.snip2texMore = false;
+                        selectionRoot.snip2texSend("solve");
+                    }
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texCheckButton
+                    visible: selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    text: "Check work"
+                    opacity: selectionRoot.snip2texBusy ? 0.4 : 1
+                    onClicked: {
+                        selectionRoot.snip2texMore = false;
+                        selectionRoot.snip2texSend("check");
+                    }
+                }
+                ArkControls.ContextualMenu.Button {
+                    id: snip2texBackButton
+                    visible: selectionRoot.snip2texMore
+                    focusPolicy: Qt.NoFocus
+                    type: tools.type
+                    text: "‹"
+                    onClicked: selectionRoot.snip2texMore = false
+                }
+            }
+        END TRAVERSE
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qml/device/view/documentview/DeviceSceneView.qml
+    IMPORT xofm.libs.ghostbuster 1.0
+    TRAVERSE FocusScope#root
+        LOCATE AFTER ALL
+        INSERT {
+            // creates snip2tex's popups and jobs in this view's context, which
+            // lives as long as the document is open (see snip2texFactory)
+            function snip2texCreate(qml, parent, name) {
+                return Qt.createQmlObject(qml, parent, name);
+            }
+
+            // E-ink: hiding an item doesn't always repaint that part of the panel,
+            // so a closed popup stayed visible. Stock dialogs in the document view
+            // tell the ghost buster when they open/close (DocumentView
+            // handleDialogGhosting); do the same. Falls back to a full clear.
+            function snip2texGhosting(open) {
+                try {
+                    ghostBuster.viewChange(open ? GhostBuster.DocumentViewDialogOpened
+                                                : GhostBuster.DocumentViewDialogClosed);
+                    return "ghostBuster";
+                } catch (e) {
+                    console.log("[snip2tex] ghostBuster.viewChange: " + e);
+                }
+                if (open) {
+                    return "none";
+                }
+                try {
+                    ghostBuster.forceClearNow("snip2tex popup closed");
+                    return "forceClearNow";
+                } catch (e) {
+                    console.log("[snip2tex] ghostBuster.forceClearNow: " + e);
+                }
+                try {
+                    EPFramebuffer.scheduleGhostRemoval();
+                    return "EPFramebuffer";
+                } catch (e) {
+                    console.log("[snip2tex] EPFramebuffer: " + e);
+                }
+                return "none";
+            }
+        }
+    END TRAVERSE
+    TRAVERSE FocusScope#root > Component#selectionHandlerComponent > SceneSelectionHandler#selectionHandler
+        LOCATE AFTER ALL
+        INSERT {
+            snip2texFactory: root
+            // mirrors onDeleteSelection; without replace it only ends the selection
+            onSnip2texDone: (replace) => {
+                hwcSelectionTool.close();
+                if (replace) {
+                    controller.deleteSelectedItems(controller.currentLayer);
+                }
+                root.forceMoveTool();
+                root.endItemSelection();
+            }
+        }
+    END TRAVERSE
+END AFFECT

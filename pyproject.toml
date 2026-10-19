@@ -1,0 +1,15 @@
+[project]
+name = "snip2tex"
+version = "0.1.0"
+description = "reMarkable lasso → LaTeX / evaluate / graph, with a local Gemma vision model"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "mlx-vlm>=0.7.9",
+    "pillow",
+    "sympy",
+    "lark",
+    "matplotlib",
+    "numpy",
+    "rumps",
+    "pyobjc-framework-WebKit",
+]
