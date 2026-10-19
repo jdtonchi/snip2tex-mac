@@ -45,6 +45,9 @@ def main():
         KEY.parent.mkdir(parents=True, exist_ok=True)
         run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "snip2tex", "-f", str(KEY)])
     pub = KEY.with_suffix(".pub").read_text().strip()
+    print("The tablet's root password is under Settings > General > Help > Copyrights and licenses.\n"
+          "Back it up somewhere off the tablet before continuing: you need it to get back in over SSH,\n"
+          "and it changes after a factory reset.", flush=True)
     # password prompt (once): install the key
     run(["ssh", "-o", "StrictHostKeyChecking=accept-new", target,
          f"mkdir -p ~/.ssh && grep -qxF '{pub}' ~/.ssh/authorized_keys 2>/dev/null || echo '{pub}' >> ~/.ssh/authorized_keys"])

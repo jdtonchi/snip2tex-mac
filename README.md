@@ -10,7 +10,7 @@ Lasso handwriting on a reMarkable Paper Pro, tap a button, get the result from a
 | Computer | Apple Silicon Mac, macOS 14+ |
 | Model | Gemma 4 vision (MLX), in-process via mlx-vlm. Default E2B (~4 GB). Any MLX vision model in `~/.lmstudio/models` works |
 | Optional backend | LM Studio OpenAI-compatible API |
-| Link | USB (10.11.99.x). Optional Wi-Fi via Tailscale Funnel |
+| Link | USB (10.11.99.x). Optional Wi-Fi via Tailscale Funnel, off by default ([WIFI.md](WIFI.md)) |
 | LaTeX | tectonic (downloaded on first run) |
 | Math | SymPy |
 | Plots | matplotlib |
@@ -42,6 +42,8 @@ open -a Snip2TeX
 
 Menu bar: ∑. First run downloads tectonic and the default model.
 
+Before anything on the tablet: back up its root SSH password. It is under Settings > General > Help > Copyrights and licenses (developer mode on). Store it somewhere off the tablet (password manager). You need it to install, to get back in over SSH if the key stops working, and to recover if xovi leaves the tablet in a bad state. It changes after a factory reset.
+
 Tablet (USB, xovi installed with qt-resource-rebuilder, qt-command-executor, framebuffer-spy, xovi-message-broker):
 
 ```sh
@@ -60,7 +62,7 @@ xovi does not survive a tablet reboot. While the tablet is plugged in, the app r
 | Selection padding | 5 px |
 | Popup auto-hide | 30 s |
 | Stay awake with lid closed | off (`pmset disablesleep`, restored on quit and at 15% battery) |
-| Wi-Fi mode | off (Tailscale Funnel, token-protected, tablet endpoints only) |
+| Wi-Fi mode | off (Tailscale Funnel, token-protected, tablet endpoints only). Setup: [WIFI.md](WIFI.md) |
 
 ## Files
 
