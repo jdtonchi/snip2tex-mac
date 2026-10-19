@@ -15,6 +15,7 @@ import deps
 import diagrams
 import model as backends
 import power
+import install_tablet
 import remote
 import tablet
 import tutor
@@ -873,6 +874,10 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, status())
         if path == "/api/remote":
             return self.send(200, remote_status())
+        if path == "/api/setup":
+            return self.send(200, dict(setup_state, needed=needs_setup(),
+                                       reachable=install_tablet.reachable(config["tablet_host"]),
+                                       help=install_tablet.PASSWORD_HELP))
         if path.startswith("/snips/"):
             f = SNIPS / Path(path).name
             if f.exists():
@@ -952,6 +957,11 @@ class H(BaseHTTPRequestHandler):
             want = bool(json.loads(self.read_body() or b"{}").get("awake"))
             ok = power.set_sleep_disabled(want)
             return self.send(200 if ok else 500, power.status())
+        if path == "/api/setup":
+            # {"password": "..."}: first-launch tablet setup; the password isn't stored
+            if not setup_state["running"]:
+                run_setup(json.loads(self.read_body() or b"{}").get("password") or None)
+            return self.send(200, setup_state)
         if path == "/api/remote":
             # {"on": true} turns Wi-Fi mode (Tailscale Funnel) on
             on = bool(json.loads(self.read_body() or b"{}").get("on"))
@@ -973,6 +983,38 @@ class H(BaseHTTPRequestHandler):
             entry, _ = process(self.read_body(), "dashboard")
             return self.send(200, entry)
         self.send(404, {"error": "not found"})
+
+
+# ---------- first-launch setup ----------
+
+setup_state = {"running": False, "log": [], "ok": False, "error": ""}
+
+
+def needs_setup():
+    """No key yet, the key isn't accepted, or the patch isn't on the tablet."""
+    st = watcher.status()
+    return (not install_tablet.KEY.exists() or st["state"] == "no ssh key"
+            or "patch missing" in st["detail"]
+            or (st["state"] == "error" and "denied" in st["detail"].lower()))
+
+
+def run_setup(password):
+    """Dashboard onboarding: install the key with the password (used once, not
+    saved) and copy the tablet patch. Progress in setup_state."""
+    setup_state.update(running=True, log=[], ok=False, error="")
+
+    def work():
+        try:
+            install_tablet.install(config["tablet_host"], config["port"], password=password,
+                                   log=setup_state["log"].append)
+            setup_state["ok"] = True
+        except install_tablet.SetupError as e:
+            setup_state["error"] = str(e)
+        except Exception as e:
+            setup_state["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            setup_state["running"] = False
+    threading.Thread(target=work, daemon=True).start()
 
 
 TABLET_PATHS = ("/snip", "/eval", "/graph", "/ask", "/solve", "/check")
@@ -1044,7 +1086,19 @@ button{margin-top:10px;padding:6px 12px;border-radius:6px;border:1px solid var(-
 </style></head><body><main>
 <div>
  <h1>snip2tex</h1>
- <div class="card"><h2>Connection</h2><div id="conn">…</div></div>
+ <div class="card" id="setupCard" style="display:none"><h2>Set up the tablet</h2>
+  <div id="setupSteps"></div>
+  <div id="setupForm">
+   <label>Tablet root password (used once to install a key; not saved)</label>
+   <input id="setupPw" type="password" autocomplete="off">
+   <div class="meta" id="setupHelp"></div>
+   <label style="display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="setupBacked" style="width:auto"> I've backed up this password somewhere off the tablet</label>
+   <button id="setupBtn" onclick="runSetup()">Set up tablet</button>
+  </div>
+  <pre id="setupLog" style="white-space:pre-wrap;display:none"></pre>
+  <div class="meta"><a href="#" onclick="hideSetup();return false">Skip for now</a></div>
+ </div>
+ <div class="card"><h2>Connection</h2><div id="conn">…</div><div class="meta"><a href="#" onclick="showSetup();return false">Set up tablet…</a></div></div>
  <div class="card"><h2>Config</h2>
   <label>Model runs</label><select id="backend" onchange="showBackend()">
    <option value="builtin">built in (MLX, no LM Studio)</option><option value="lmstudio">in LM Studio</option></select>
@@ -1152,6 +1206,28 @@ async function save(){
 }
 async function test(){const f=document.getElementById('f').files[0];if(f){fetch('/api/test',{method:'POST',body:f});setTimeout(tick,300);}}
 tick();setInterval(tick,2000);
+let setupHidden=false, setupForced=false;
+try{setupHidden=localStorage.getItem('setupSkipped')==='1';}catch(e){}
+function hideSetup(){setupHidden=true;setupForced=false;try{localStorage.setItem('setupSkipped','1');}catch(e){}document.getElementById('setupCard').style.display='none';}
+function showSetup(){setupForced=true;setupTick();}
+async function setupTick(){try{
+ const st=await (await fetch('/api/setup')).json(), card=document.getElementById('setupCard');
+ const show=setupForced||st.running||(st.needed&&!setupHidden&&!st.ok);
+ card.style.display=show?'':'none'; if(!show)return;
+ document.getElementById('setupHelp').textContent=st.help;
+ document.getElementById('setupSteps').innerHTML=`<div>${dot(st.reachable)}${st.reachable?'Tablet connected over USB':'Plug the tablet in over USB (developer mode on, xovi installed)'}</div>`;
+ const log=document.getElementById('setupLog');
+ const lines=st.log.slice(); if(st.running)lines.push('working…'); if(st.error)lines.push('failed: '+st.error); if(st.ok)lines.push('Tablet set up.');
+ log.style.display=lines.length?'':'none'; log.textContent=lines.join('\n');
+ document.getElementById('setupBtn').disabled=st.running||!st.reachable;
+ document.getElementById('setupForm').style.display=st.ok?'none':'';
+ if(st.ok){setupForced=false;}
+}catch(e){}}
+async function runSetup(){
+ if(!document.getElementById('setupBacked').checked){alert('Back up the password first: you need it to get back into the tablet, and it changes after a factory reset.');return;}
+ const pw=document.getElementById('setupPw'); await fetch('/api/setup',{method:'POST',body:JSON.stringify({password:pw.value})});
+ pw.value=''; setupTick();}
+setupTick();setInterval(setupTick,2000);
 </script></body></html>"""
 
 

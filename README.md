@@ -44,7 +44,7 @@ Menu bar: ∑. First run downloads tectonic and the default model.
 
 Before anything on the tablet: back up its root SSH password. It is under Settings > General > Help > Copyrights and licenses (developer mode on). Store it somewhere off the tablet (password manager). You need it to install, to get back in over SSH if the key stops working, and to recover if xovi leaves the tablet in a bad state. It changes after a factory reset.
 
-Tablet (USB, xovi installed with qt-resource-rebuilder, qt-command-executor, framebuffer-spy, xovi-message-broker):
+Tablet (USB, xovi installed with qt-resource-rebuilder, qt-command-executor, framebuffer-spy, xovi-message-broker): on first launch the dashboard shows "Set up the tablet". Plug the tablet in, enter the root password (used once to install an SSH key, not saved), confirm it is backed up, press Set up tablet. Again later: Connection card, "Set up tablet…". From a terminal instead:
 
 ```sh
 uv run install_tablet.py

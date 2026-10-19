@@ -5,6 +5,7 @@ description = "reMarkable lasso → LaTeX / evaluate / graph, with a local Gemma
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "mlx-vlm>=0.7.9",
+    "paramiko",
     "pillow",
     "sympy",
     "lark",
