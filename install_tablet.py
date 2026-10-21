@@ -126,13 +126,15 @@ def install(host="10.11.99.1", port=8799, password=None, log=print):
     t = HERE / "tablet"
     for src, dst in ((t / "snip2tex.qmd", f"{XOVI}/exthome/qt-resource-rebuilder/snip2tex.qmd"),
                      (t / "snip2tex.rcc", f"{XOVI}/exthome/qt-resource-rebuilder/snip2tex.rcc"),
-                     (t / "snip.sh", f"{XOVI}/exthome/snip2tex/snip.sh")):
+                     (t / "snip2tex-toolbar.qmd", f"{XOVI}/exthome/qt-resource-rebuilder/snip2tex-toolbar.qmd"),
+                     (t / "snip.sh", f"{XOVI}/exthome/snip2tex/snip.sh"),
+                     (t / "model.sh", f"{XOVI}/exthome/snip2tex/model.sh")):
         r = subprocess.run(["scp", *ssh_opts(), str(src), f"{target}:{dst}"], capture_output=True, text=True,
                            timeout=60)
         if r.returncode != 0:
             raise SetupError(f"copying {src.name} failed: {r.stderr.strip()[-200:]}")
     server = f"http://{usb_ip(host)}:{port}"
-    sh(f"chmod +x {XOVI}/exthome/snip2tex/snip.sh && echo {server} > {XOVI}/exthome/snip2tex/server")
+    sh(f"chmod +x {XOVI}/exthome/snip2tex/snip.sh {XOVI}/exthome/snip2tex/model.sh && echo {server} > {XOVI}/exthome/snip2tex/server")
     sh(f"[ -f {XOVI}/exthome/snip2tex/config.json ] || cat > {XOVI}/exthome/snip2tex/config.json",
        stdin=json.dumps({"replace_snip": True, "replace_graph": False, "selection_padding": 5,
                          "popup_seconds": 30, "grab_delay_ms": 700}, sort_keys=True))

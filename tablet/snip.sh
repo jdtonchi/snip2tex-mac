@@ -17,7 +17,7 @@ TOKEN=$(cat $DIR/token 2>/dev/null)
 TMP=/tmp/snip2tex.raw
 LOG=/home/root/.snip2tex/log
 
-fail() { echo "$(date) $*" >> $LOG; echo "$*" > "$OUT.err"; exit 1; }
+fail() { echo "$(date) $*" >> $LOG; echo "$*" > "$OUT.err"; rm -f "$OUT.grabbed"; exit 1; }
 
 # "0xADDR,width,height,type,bytesPerLine,requiresReload"
 echo '>eframebuffer-spy$getConfigString:' > /run/xovi-mb
@@ -36,12 +36,18 @@ REST=${REST#*,}; REST=${REST#*,}; BPL=${REST%%,*}
 
 dd if=/proc/$(pidof xochitl)/mem of=$TMP bs=$BPL count=$H \
     iflag=skip_bytes skip=$((ADDR + Y * BPL)) 2>/dev/null || fail "dd failed"
+# the QML keeps the controls hidden (and the "thinking…" popup away) until this
+echo 1 > "$OUT.grabbed"
 
 # busybox wget --post-file stops at the first NUL byte, so gzip + base64 it
 gzip -c -1 $TMP | openssl base64 -A > $TMP.b64 || fail "encode failed"
-# USB first; no cable (or the Mac's USB address changed) -> Wi-Fi via Funnel
+# USB first; no cable (or the Mac's USB address changed) -> Wi-Fi via Funnel.
+# With Wi-Fi preferred (toolbar ✦ menu, $DIR/prefer_wifi): the other way round.
 URL=$SERVER
-if [ -n "$REMOTE" ] && ! wget -q -T 3 -O /dev/null "$SERVER/ping" 2>/dev/null; then
+if [ -n "$REMOTE" ] && [ -f $DIR/prefer_wifi ]; then
+    URL=$REMOTE
+    wget -q -T 5 -O /dev/null "$REMOTE/ping?token=$TOKEN" 2>/dev/null || URL=$SERVER
+elif [ -n "$REMOTE" ] && ! wget -q -T 3 -O /dev/null "$SERVER/ping" 2>/dev/null; then
     URL=$REMOTE
 fi
 # -S: response headers go to stderr (the ? button's diagram caption is one)
@@ -63,6 +69,7 @@ rm -f "$OUT.hdr"
 
 # image modes get text back when the Mac side failed: hand it to the popup
 case "$OUT" in *.png)
-    dd if="$OUT.part" bs=4 count=1 2>/dev/null | grep -q PNG || { mv "$OUT.part" "$OUT.err"; exit 1; } ;;
+    dd if="$OUT.part" bs=4 count=1 2>/dev/null | grep -q PNG || { mv "$OUT.part" "$OUT.err"; rm -f "$OUT.grabbed"; exit 1; } ;;
 esac
 mv "$OUT.part" "$OUT"
+rm -f "$OUT.grabbed"

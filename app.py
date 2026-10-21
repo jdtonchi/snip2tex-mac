@@ -81,6 +81,7 @@ class Snip2TeXApp(rumps.App):
             self.tablet_item,
             None,
             rumps.MenuItem("Open Snip2TeX", callback=lambda _: self.show_window()),
+            rumps.MenuItem("Open Gallery…", callback=lambda _: self.show_window("/gallery")),
             rumps.MenuItem("Open in Browser", callback=self.open_browser),
             rumps.MenuItem("Reload Model", callback=lambda _: snip2tex.load_model()),
             None,
@@ -136,8 +137,8 @@ class Snip2TeXApp(rumps.App):
             "on screen", w.isVisible() if w else None,
             "bar thickness", NSStatusBar.systemStatusBar().thickness())
 
-    def show_window(self):
-        url = f"http://localhost:{snip2tex.config['port']}/"
+    def show_window(self, page="/"):
+        url = f"http://localhost:{snip2tex.config['port']}{page}"
         if self.window is None:
             style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                      NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)

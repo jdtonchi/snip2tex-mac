@@ -1,0 +1,368 @@
+; snip2tex toolbar: a ✦ button at the end of the document toolbar (next to the
+; page overview / tags / menu buttons) that opens a small menu to pick the model
+; the Mac uses (the local model or a Claude model) and switch thinking on/off.
+; The menu talks to the Mac through model.sh (USB, or Wi-Fi mode), which saves
+; the Mac's JSON reply to a file this polls. Kept apart from snip2tex.qmd so it
+; can be removed on its own. Icon: qrc:/snip2tex/sparkle.svg from snip2tex.rcc.
+; Needs: qt-command-executor. Written against firmware 3.27.3.0.
+
+AFFECT /qt/qml/xofm/libs/toolbar/qml/Toolbar.qml
+    IMPORT net.asivery.CommandExecutor 1.0
+    IMPORT xofm.libs.ghostbuster 1.0
+    TRAVERSE FocusScope#root > Item#toolbar > GridLayout#toolLayout
+        LOCATE AFTER ALL
+        INSERT {
+            ArkControls.ToolButton {
+                id: snip2texModelButton
+                objectName: "snip2tex-model-button"
+                iconSource: "qrc:/snip2tex/sparkle.svg"
+                focusPolicy: Qt.NoFocus
+                visible: root.expanded
+                background: Item {}
+                onClicked: snip2texModelMenu.toggle(snip2texModelButton)
+
+                PenInputBlocker {
+                    anchors.fill: parent
+                    enabled: true
+                    manager: root.penInput.surfaceManager
+                }
+            }
+        }
+    END TRAVERSE
+    TRAVERSE FocusScope#root
+        LOCATE AFTER ALL
+        INSERT {
+            Item {
+                id: snip2texModelMenu
+                anchors.fill: parent
+                visible: false
+                z: 1000
+
+                property var menu: ({})
+                property string status: ""
+                property string out: ""
+                property int polls: 0
+                // the button's rect, in this item's coordinates
+                property rect at: Qt.rect(0, 0, 0, 0)
+
+                // not "log": Toolbar.qml has a LoggingCategory with id log, and ids win
+                function snip2texLog(msg) {
+                    console.log("[snip2tex] toolbar: " + msg);
+                }
+
+                function readFile(path) {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "file://" + path, false);
+                    try { xhr.send(); } catch (e) { return ""; }
+                    return (xhr.responseText || "").trim();
+                }
+
+                // e-ink: tell xochitl's ghost buster, like stock dialogs do, so
+                // the panel is repainted where the menu was
+                function ghosting(open) {
+                    let p = root;
+                    while (p && p.ghostBuster === undefined) {
+                        p = p.parent;
+                    }
+                    try {
+                        if (p) {
+                            p.ghostBuster.viewChange(open ? GhostBuster.DocumentViewDialogOpened
+                                                          : GhostBuster.DocumentViewDialogClosed);
+                        }
+                    } catch (e) {
+                        snip2texModelMenu.snip2texLog("ghostBuster: " + e);
+                    }
+                }
+
+                function toggle(button) {
+                    if (visible) {
+                        close();
+                        return;
+                    }
+                    const p = button.mapToItem(snip2texModelMenu, 0, 0);
+                    at = Qt.rect(p.x, p.y, button.width, button.height);
+                    const cached = readFile("/home/root/xovi/exthome/snip2tex/model.json");
+                    try {
+                        menu = cached ? JSON.parse(cached) : {};
+                    } catch (e) {
+                        menu = {};
+                    }
+                    visible = true;
+                    ghosting(true);
+                    run("");
+                }
+
+                function close() {
+                    if (!visible) {
+                        return;
+                    }
+                    visible = false;
+                    ghosting(false);
+                }
+
+                function run(args) {
+                    out = "/home/root/.snip2tex/model-" + Date.now() + ".json";
+                    status = args ? "switching…" : "asking the Mac…";
+                    polls = 0;
+                    snip2texModelCmd.executeCommand("env", ["-u", "LD_PRELOAD", "sh", "-c",
+                        "/home/root/xovi/exthome/snip2tex/model.sh " + out + " " + args + " >/dev/null 2>&1 &"]);
+                    poll.restart();
+                }
+
+                function choose(id) {
+                    if (id === menu.current) {
+                        return;
+                    }
+                    snip2texModelMenu.snip2texLog("model " + id);
+                    const m = Object.assign({}, menu);
+                    m.current = id;
+                    menu = m;
+                    run("set " + id);
+                }
+
+                function toggleWifi() {
+                    const on = !menu.prefer_wifi;
+                    const m = Object.assign({}, menu);
+                    m.prefer_wifi = on;
+                    menu = m;
+                    run("wifi " + (on ? "on" : "off"));
+                    status = on ? "connecting over Wi-Fi (Tailscale)…" : "switching to USB…";
+                }
+
+                function toggleThinking() {
+                    if (menu.thinking_locked) {
+                        return;
+                    }
+                    const m = Object.assign({}, menu);
+                    m.thinking = !menu.thinking;
+                    menu = m;
+                    run("thinking " + (m.thinking ? 1 : 0));
+                }
+
+                CommandExecutor {
+                    id: snip2texModelCmd
+                }
+
+                Timer {
+                    id: poll
+                    interval: 300
+                    repeat: true
+                    onTriggered: {
+                        const err = snip2texModelMenu.readFile(snip2texModelMenu.out + ".err");
+                        if (err) {
+                            snip2texModelMenu.status = err;
+                            stop();
+                            return;
+                        }
+                        const text = snip2texModelMenu.readFile(snip2texModelMenu.out);
+                        if (text) {
+                            try {
+                                const m = JSON.parse(text);
+                                snip2texModelMenu.menu = m;
+                                snip2texModelMenu.status = m.note ? m.note
+                                    : m.state === "loading" ? "loading the model on the Mac…"
+                                    : m.state === "error" ? (m.error || "model error") : "";
+                            } catch (e) {
+                                snip2texModelMenu.status = "bad reply from the Mac";
+                            }
+                            stop();
+                            return;
+                        }
+                        if (++snip2texModelMenu.polls > 200) {
+                            snip2texModelMenu.status = "no answer from the Mac";
+                            stop();
+                        }
+                    }
+                }
+
+                Connections {
+                    target: root
+                    function onExpandedChanged() {
+                        snip2texModelMenu.close();
+                    }
+                }
+
+                // a tap anywhere else closes the menu
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: snip2texModelMenu.close()
+                }
+
+                Rectangle {
+                    id: card
+                    width: 600
+                    height: column.implicitHeight + 32
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    radius: 12
+                    readonly property int gap: 12
+                    x: {
+                        const a = snip2texModelMenu.at;
+                        let v = root.position === ToolbarPositioner.Position.Left ? a.x + a.width + gap
+                              : root.position === ToolbarPositioner.Position.Right ? a.x - width - gap
+                              : a.x + a.width - width;
+                        return Math.max(16, Math.min(v, snip2texModelMenu.width - width - 16));
+                    }
+                    y: {
+                        const a = snip2texModelMenu.at;
+                        let v = root.position === ToolbarPositioner.Position.Bottom ? a.y - height - gap
+                              : root.position === ToolbarPositioner.Position.Top ? a.y + a.height + gap
+                              : a.y;
+                        return Math.max(16, Math.min(v, snip2texModelMenu.height - height - 16));
+                    }
+
+                    // swallow taps on the card itself
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+                    PenInputBlocker {
+                        anchors.fill: parent
+                        enabled: snip2texModelMenu.visible
+                        manager: root.penInput.surfaceManager
+                    }
+
+                    Column {
+                        id: column
+                        x: 16
+                        y: 16
+                        width: parent.width - 32
+                        spacing: 4
+
+                        Text {
+                            text: "AI model"
+                            font.pixelSize: 26
+                            font.bold: true
+                            color: "#555555"
+                            bottomPadding: 6
+                        }
+
+                        Repeater {
+                            model: snip2texModelMenu.menu.options || []
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: column.width
+                                height: 72
+                                radius: 8
+                                color: modelData.id === snip2texModelMenu.menu.current ? "black" : "white"
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: 16
+                                    width: parent.width - 32
+                                    elide: Text.ElideRight
+                                    text: modelData.label
+                                    font.pixelSize: 30
+                                    color: modelData.id === snip2texModelMenu.menu.current ? "white" : "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: snip2texModelMenu.choose(modelData.id)
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: column.width
+                            height: 2
+                            color: "#bbbbbb"
+                            visible: (snip2texModelMenu.menu.options || []).length > 0
+                        }
+
+                        Rectangle {
+                            width: column.width
+                            height: 72
+                            color: "white"
+                            visible: (snip2texModelMenu.menu.options || []).length > 0
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 16
+                                text: snip2texModelMenu.menu.thinking_locked ? "Thinking: always on"
+                                    : "Thinking: " + (snip2texModelMenu.menu.thinking ? "on" : "off")
+                                font.pixelSize: 30
+                                color: snip2texModelMenu.menu.thinking_locked ? "#777777" : "black"
+                            }
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.right: parent.right
+                                anchors.rightMargin: 16
+                                width: 84
+                                height: 44
+                                radius: 22
+                                border.color: "black"
+                                border.width: 3
+                                color: snip2texModelMenu.menu.thinking ? "black" : "white"
+                                opacity: snip2texModelMenu.menu.thinking_locked ? 0.4 : 1
+                                Rectangle {
+                                    width: 32
+                                    height: 32
+                                    radius: 16
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: snip2texModelMenu.menu.thinking ? parent.width - width - 6 : 6
+                                    color: snip2texModelMenu.menu.thinking ? "white" : "black"
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: snip2texModelMenu.toggleThinking()
+                            }
+                        }
+
+                        Rectangle {
+                            width: column.width
+                            height: 92
+                            color: "white"
+                            Column {
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 16
+                                Text {
+                                    text: "Use Wi-Fi (Tailscale)"
+                                    font.pixelSize: 30
+                                    color: "black"
+                                }
+                                Text {
+                                    text: snip2texModelMenu.menu.route === "wifi" ? "connected over Wi-Fi"
+                                        : snip2texModelMenu.menu.route === "usb" ? "connected over USB" : ""
+                                    font.pixelSize: 22
+                                    color: "#555555"
+                                }
+                            }
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.right: parent.right
+                                anchors.rightMargin: 16
+                                width: 84
+                                height: 44
+                                radius: 22
+                                border.color: "black"
+                                border.width: 3
+                                color: snip2texModelMenu.menu.prefer_wifi ? "black" : "white"
+                                Rectangle {
+                                    width: 32
+                                    height: 32
+                                    radius: 16
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: snip2texModelMenu.menu.prefer_wifi ? parent.width - width - 6 : 6
+                                    color: snip2texModelMenu.menu.prefer_wifi ? "white" : "black"
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: snip2texModelMenu.toggleWifi()
+                            }
+                        }
+
+                        Text {
+                            width: column.width
+                            visible: text !== ""
+                            text: snip2texModelMenu.status
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: 24
+                            color: "#555555"
+                            topPadding: 6
+                        }
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT

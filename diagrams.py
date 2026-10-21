@@ -9,6 +9,12 @@ maps, charts. The ? button can also pick "answer" (plain text instead).
 """
 import io, json, math, re, textwrap
 
+# Color mode (set by the server from its config): charts are filled with the
+# Paper Pro's ink colours instead of black outlines and hatching.
+COLOR = False
+INKS = ["#1f4fd1", "#c62828", "#2e7d32", "#ef6c00", "#7b1fa2", "#00838f"]
+LIGHT = ["#90a8ec", "#e39393", "#96be98", "#f7b57f", "#bd8fd1", "#7fc1c7"]  # pie slices: black labels stay readable
+
 KINDS = {
     "function": "a function, equation or inequality to graph on axes (y = x^2, sin x and cos x, a circle x^2+y^2=9)",
     "geometry": "a geometric figure: triangle, right triangle, circle, rectangle, square, regular polygon "
@@ -653,13 +659,14 @@ def render_chart(spec, dpi):
     if not series:
         raise ValueError("no numbers found")
     plt, fig, ax = _fig(dpi)
-    colors = ["black", "#1f4fd1", "#c62828", "#2e7d32"]
+    colors = INKS if COLOR else ["black", "#1f4fd1", "#c62828", "#2e7d32"]
     kind, caption = spec.get("chart", "bar"), ""
     cats = spec.get("categories") or []
     if kind == "pie":
         ys = series[0]["y"]
         names = cats[:len(ys)] + [str(i + 1) for i in range(len(cats), len(ys))]
-        ax.pie(ys, labels=names, autopct="%1.0f%%", colors=["white"] * len(ys),
+        ax.pie(ys, labels=names, autopct="%1.0f%%",
+               colors=[LIGHT[i % len(LIGHT)] for i in range(len(ys))] if COLOR else ["white"] * len(ys),
                wedgeprops=dict(edgecolor="black", linewidth=1.8), textprops=dict(fontsize=12))
         ax.set_aspect("equal")
     elif kind == "bar" or (cats and not any(s.get("x") for s in series)):
@@ -669,8 +676,12 @@ def render_chart(spec, dpi):
         hatches = ["", "//", "..", "xx"]
         for k, s in enumerate(series):
             xs = np.arange(len(s["y"])) + (k - (len(series) - 1) / 2) * width
-            ax.bar(xs, s["y"], width, color="white", edgecolor=colors[k % 4], hatch=hatches[k % 4],
-                   lw=1.8, label=s["name"] or None)
+            if COLOR:
+                ax.bar(xs, s["y"], width, color=colors[k % len(colors)], edgecolor="black",
+                       lw=1.2, label=s["name"] or None)
+            else:
+                ax.bar(xs, s["y"], width, color="white", edgecolor=colors[k % len(colors)], hatch=hatches[k % 4],
+                       lw=1.8, label=s["name"] or None)
         ax.set_xticks(range(n), names, rotation=30 if max(map(len, names)) > 4 else 0, ha="right"
                       if max(map(len, names)) > 4 else "center")
     else:
@@ -678,16 +689,16 @@ def render_chart(spec, dpi):
             ys = np.asarray(s["y"], dtype=float)
             xs = np.asarray(s["x"] if len(s.get("x") or []) == len(ys) else range(1, len(ys) + 1), dtype=float)
             if kind == "line":
-                ax.plot(xs, ys, color=colors[k % 4], lw=2.5, marker="o", label=s["name"] or None)
+                ax.plot(xs, ys, color=colors[k % len(colors)], lw=2.5, marker="o", label=s["name"] or None)
             else:
-                ax.plot(xs, ys, "o", color=colors[k % 4], ms=7, label=s["name"] or None)
+                ax.plot(xs, ys, "o", color=colors[k % len(colors)], ms=7, label=s["name"] or None)
             if spec.get("fit") == "linear" and len(xs) >= 2:
                 m, b = np.polyfit(xs, ys, 1)
                 pred = m * xs + b
                 ss = ((ys - ys.mean()) ** 2).sum()
                 r2 = 1 - ((ys - pred) ** 2).sum() / ss if ss else 1.0
                 line = np.linspace(xs.min(), xs.max(), 50)
-                ax.plot(line, m * line + b, color=colors[k % 4], ls="--", lw=1.8)
+                ax.plot(line, m * line + b, color=colors[k % len(colors)], ls="--", lw=1.8)
                 caption = f"y = {fmt(m)}x {'+' if b >= 0 else '−'} {fmt(abs(b))}, R² = {r2:.3f}"
         if caption:
             ax.text(0.02, 0.97, caption, transform=ax.transAxes, va="top", fontsize=12,

@@ -161,7 +161,9 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                         label.text = text;
                         resultPath = "";
                         if (closed) {
-                            destroy();
+                            if (!settle.running) {
+                                destroy();
+                            }
                         } else if (hideAfterMs > 0) {
                             hideTimer.start();
                         }
@@ -258,8 +260,28 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                                         }
                                     } catch (e) {}
                                     popupRoot.controller.insertImageFileAsSceneItem("file://" + png, popupRoot.insertAt);
+                                    console.log("[snip2tex] inserted " + png + ", pendingEdit " + popupRoot.controller.pendingEdit);
+                                    settle.start();
                                 }
                                 popupRoot.done(res);
+                            }
+                        }
+                    }
+                    // same as the job: commit the insert so the first move sticks
+                    Timer {
+                        id: settle
+                        interval: 300
+                        onTriggered: {
+                            try {
+                                if (popupRoot.controller.pendingEdit) {
+                                    popupRoot.controller.applyPendingEdit(popupRoot.controller.currentLayer);
+                                    console.log("[snip2tex] applied pending edit after insert");
+                                }
+                            } catch (e) {
+                                console.log("[snip2tex] applyPendingEdit: " + e);
+                            }
+                            if (popupRoot.closed) {
+                                popupRoot.destroy();
                             }
                         }
                     }
@@ -317,9 +339,27 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                                     job.handler.snip2texDone(job.replace);
                                 }
                                 job.controller.insertImageFileAsSceneItem("file://" + job.out, job.insertAt);
-                                console.log("[snip2tex] inserted " + job.out);
-                                job.destroy();
+                                console.log("[snip2tex] inserted " + job.out + ", pendingEdit " + job.controller.pendingEdit);
+                                settle.start();
                             }
+                        }
+                    }
+                    // the insert can leave an open pending edit; the next move of the
+                    // image then got cancelled with it (snapped back the first time)
+                    Timer {
+                        id: settle
+                        interval: 300
+                        onTriggered: {
+                            const job = parent;
+                            try {
+                                if (job.controller.pendingEdit) {
+                                    job.controller.applyPendingEdit(job.controller.currentLayer);
+                                    console.log("[snip2tex] applied pending edit after insert");
+                                }
+                            } catch (e) {
+                                console.log("[snip2tex] applyPendingEdit: " + e);
+                            }
+                            job.destroy();
                         }
                     }
                 }`
@@ -398,8 +438,10 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                 snip2texBusy = true;
                 snip2texMode = mode;
                 snip2texCfg = snip2texConfig();
-                // hide tint, border and menu so the framebuffer only has ink
+                // hide tint, border and menu so the framebuffer only has ink, and
+                // (exact_selection) blank out the unselected ink inside the box
                 controlsAreVisible = false;
+                snip2texGrabbing = snip2texCfg.exact_selection !== false;
                 snip2texGrabDelay.interval = snip2texCfg.grab_delay_ms || 700;
                 snip2texGrabDelay.restart();
             }
@@ -431,32 +473,77 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                     // detach, and keep xovi out of the child process
                     snip2texCmd.executeCommand("env", ["-u", "LD_PRELOAD", "sh", "-c",
                         "/home/root/xovi/exthome/snip2tex/snip.sh " + args + " >/dev/null 2>&1 &"]);
-                    controlsAreVisible = true;
-                    selectionRoot.snip2texBusy = false;
-
-                    if (textMode) {
-                        const waiting = {eval: "evaluating…", ask: "thinking…", solve: "solving…", check: "checking…"};
-                        snip2texShow(waiting[mode], out, mode === "ask" || mode === "solve");
-                        return;
-                    }
-                    const host = snip2texHost();
-                    if (!host) {
-                        return;
-                    }
-                    const replace = mode === "snip" ? !!cfg.replace_snip : !!cfg.replace_graph;
-                    // scene coords: in place of the handwriting, or just below it
-                    const r = selectionRoot.sceneSelectionRect;
-                    const job = snip2texCreate(snip2texJobQml, host, "snip2texJob");
-                    job.popupQml = snip2texPopupQml;
-                    job.popupFrame = snip2texFrame(host);
-                    job.popupOverlay = snip2texOverlay();
-                    job.factory = snip2texFactory;
-                    job.controller = controller;
-                    job.handler = selectionRoot;
-                    job.replace = replace;
-                    job.insertAt = replace ? Qt.point(r.x, r.y) : Qt.point(r.x, r.y + r.height + 20);
-                    job.out = out;
+                    // keep the screen as it is (controls hidden, white behind the
+                    // selected strokes, no popup) until snip.sh has copied it
+                    selectionRoot.snip2texOut = out;
+                    snip2texGrabWait.tries = 0;
+                    snip2texGrabWait.restart();
                 }
+            }
+
+            property string snip2texOut: ""
+            // true while the framebuffer is being copied: a white sheet hides
+            // everything in the selection box except the selected strokes
+            property bool snip2texGrabbing: false
+
+            function snip2texReadFile(path) {
+                const xhr = new XMLHttpRequest();
+                xhr.open("GET", "file://" + path, false);
+                try { xhr.send(); } catch (e) { return ""; }
+                return xhr.responseText || "";
+            }
+
+            Timer {
+                id: snip2texGrabWait
+                interval: 100
+                repeat: true
+                property int tries: 0
+                onTriggered: {
+                    const out = selectionRoot.snip2texOut;
+                    const done = selectionRoot.snip2texReadFile(out + ".grabbed") !== ""
+                        || selectionRoot.snip2texReadFile(out + ".err") !== ""
+                        || selectionRoot.snip2texReadFile(out) !== "";
+                    if (!done && ++tries < 80) {
+                        return;
+                    }
+                    stop();
+                    if (!done) {
+                        selectionRoot.snip2texLog("no grab after 8 s, going on");
+                    }
+                    selectionRoot.snip2texAfterGrab(out);
+                }
+            }
+
+            function snip2texAfterGrab(out) {
+                const mode = snip2texMode;
+                const cfg = snip2texCfg;
+                const textMode = ["eval", "ask", "solve", "check"].indexOf(mode) >= 0;
+                snip2texGrabbing = false;
+                controlsAreVisible = true;
+                snip2texBusy = false;
+
+                if (textMode) {
+                    const waiting = {eval: "evaluating…", ask: "thinking…", solve: "solving…", check: "checking…"};
+                    snip2texShow(waiting[mode], out, mode === "ask" || mode === "solve");
+                    return;
+                }
+                const host = snip2texHost();
+                if (!host) {
+                    return;
+                }
+                const replace = mode === "snip" ? !!cfg.replace_snip : !!cfg.replace_graph;
+                // scene coords: in place of the handwriting, or just below it
+                const r = sceneSelectionRect;
+                const job = snip2texCreate(snip2texJobQml, host, "snip2texJob");
+                job.popupQml = snip2texPopupQml;
+                job.popupFrame = snip2texFrame(host);
+                job.popupOverlay = snip2texOverlay();
+                job.factory = snip2texFactory;
+                job.controller = controller;
+                job.handler = selectionRoot;
+                job.replace = replace;
+                job.insertAt = replace ? Qt.point(r.x, r.y) : Qt.point(r.x, r.y + r.height + 20);
+                job.out = out;
             }
         }
 
@@ -542,6 +629,25 @@ AFFECT /qml/common/SceneSelectionHandler.qml
                 }
             }
         END TRAVERSE
+    END TRAVERSE
+    TRAVERSE Item#selectionRoot > Item#selection
+        LOCATE AFTER ALL
+        INSERT {
+            // snip2tex: during a grab, white behind the selected strokes (the
+            // preview) so other ink inside the selection box isn't sent. Covers
+            // the box plus the grab padding; z -1 keeps it under the preview.
+            Rectangle {
+                readonly property int pad: 40
+                visible: selectionRoot.snip2texGrabbing
+                z: -1
+                color: "white"
+                antialiasing: false
+                x: Math.min(0, parent.width) - pad
+                y: Math.min(0, parent.height) - pad
+                width: Math.abs(parent.width) + 2 * pad
+                height: Math.abs(parent.height) + 2 * pad
+            }
+        }
     END TRAVERSE
 END AFFECT
 

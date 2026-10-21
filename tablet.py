@@ -25,6 +25,7 @@ TABLET_KEYS = {
     "tablet_selection_padding": "selection_padding",
     "tablet_popup_seconds": "popup_seconds",
     "tablet_grab_delay_ms": "grab_delay_ms",
+    "tablet_exact_selection": "exact_selection",
 }
 
 # one round trip that reports everything the watcher needs, one key=value per line
@@ -96,7 +97,7 @@ class TabletWatcher:
             self.ssh(f"echo {want} > {SERVER_FILE}")
 
         # push the button settings from the dashboard
-        want_cfg = json.dumps({v: self.config[k] for k, v in TABLET_KEYS.items()}, sort_keys=True)
+        want_cfg = json.dumps({v: self.config[k] for k, v in TABLET_KEYS.items() if k in self.config}, sort_keys=True)
         if info.get("installed") == "yes" and info.get("tabletconfig") != want_cfg:
             self.ssh(f"cat > {TABLET_CONFIG}", stdin=want_cfg)
 
